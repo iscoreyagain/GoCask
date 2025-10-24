@@ -46,11 +46,11 @@ func (bc *BitCask) Put(key string, value string) error {
 		return fmt.Errorf("failed to write log entry: %w", err)
 	}
 
-	bc.KeyDir[key] = ValuePointer{
-		FileId: bc.currentFileId,
-		Offset: offset,
-		Size:   int64(entry.valueSize),
-	}
+    bc.KeyDir[key] = ValuePointer{
+        FileId: bc.currentFileId,
+        Offset: offset,
+        Size:   entry.Size(),
+    }
 
 	bc.activeSize += int64(n)
 
@@ -71,7 +71,7 @@ func (bc *BitCask) Get(key string) (string, error) {
 		return "", fmt.Errorf("file not found!")
 	}
 
-	entry, err := readLogEntry(file, vp.Offset)
+    entry, err := readLogEntryWithSize(file, vp.Offset, vp.Size)
 	if err != nil {
 		return "", err
 	}
@@ -239,31 +239,29 @@ func (bc *BitCask) loadFiles() error { // recover() from the existing files from
 }
 
 func (bc *BitCask) rebuildKeyDirFromFile(file *os.File, fileId int) error {
-	var offset int64 = 0
+    var offset int64 = 0
 
-	for {
-		entry, err := readLogEntry(file, offset)
-		if err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
-		}
+    for {
+        tombstone, key, totalSize, err := readLogEntryHeaderAndKey(file, offset)
+        if err != nil {
+            if err == io.EOF {
+                break
+            }
+            return err
+        }
 
-		if entry.tombstone {
-			// Remove deleted keys
-			delete(bc.KeyDir, string(entry.Key))
-		} else {
-			// Update KeyDir with latest value location
-			bc.KeyDir[string(entry.Key)] = ValuePointer{
-				FileId: fileId,
-				Offset: offset,
-				Size:   int64(entry.valueSize),
-			}
-		}
+        if tombstone {
+            delete(bc.KeyDir, string(key))
+        } else {
+            bc.KeyDir[string(key)] = ValuePointer{
+                FileId: fileId,
+                Offset: offset,
+                Size:   totalSize,
+            }
+        }
 
-		offset += entry.Size()
-	}
+        offset += totalSize
+    }
 
-	return nil
+    return nil
 }
