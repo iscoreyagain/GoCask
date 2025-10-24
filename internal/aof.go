@@ -62,40 +62,45 @@ func writeLogEntry(file *os.File, entry *LogEntry) (int, error) {
 }
 
 func readLogEntry(file *os.File, offset int64) (*LogEntry, error) {
-	entry := new(LogEntry)
+    entry := new(LogEntry)
 
-	// Move the file pointer to the expected offset
-	if _, err := file.Seek(offset, io.SeekStart); err != nil {
-		return nil, err
-	}
+    // Use pread-style reads that do not mutate the file offset.
+    // Read the fixed-size header first.
+    const headerSize int64 = 4 + 8 + 4 + 4 + 1
+    headerReader := io.NewSectionReader(file, offset, headerSize)
 
-	if err := binary.Read(file, binary.BigEndian, &entry.crc); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(file, binary.BigEndian, &entry.timestamp); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(file, binary.BigEndian, &entry.keySize); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(file, binary.BigEndian, &entry.valueSize); err != nil {
-		return nil, err
-	}
-	if err := binary.Read(file, binary.BigEndian, &entry.tombstone); err != nil {
-		return nil, err
-	}
+    if err := binary.Read(headerReader, binary.BigEndian, &entry.crc); err != nil {
+        return nil, err
+    }
+    if err := binary.Read(headerReader, binary.BigEndian, &entry.timestamp); err != nil {
+        return nil, err
+    }
+    if err := binary.Read(headerReader, binary.BigEndian, &entry.keySize); err != nil {
+        return nil, err
+    }
+    if err := binary.Read(headerReader, binary.BigEndian, &entry.valueSize); err != nil {
+        return nil, err
+    }
+    if err := binary.Read(headerReader, binary.BigEndian, &entry.tombstone); err != nil {
+        return nil, err
+    }
 
-	entry.Key = make([]byte, entry.keySize)
-	if _, err := io.ReadFull(file, entry.Key); err != nil {
-		return nil, err
-	}
+    // Read key and value using ReadAt via SectionReader to ensure full reads.
+    keyLen := int64(entry.keySize)
+    valLen := int64(entry.valueSize)
 
-	entry.Value = make([]byte, entry.valueSize)
-	if _, err := io.ReadFull(file, entry.Value); err != nil {
-		return nil, err
-	}
+    entry.Key = make([]byte, keyLen)
+    if _, err := io.ReadFull(io.NewSectionReader(file, offset+headerSize, keyLen), entry.Key); err != nil {
+        return nil, err
+    }
 
-	return entry, nil
+    valueOffset := offset + headerSize + keyLen
+    entry.Value = make([]byte, valLen)
+    if _, err := io.ReadFull(io.NewSectionReader(file, valueOffset, valLen), entry.Value); err != nil {
+        return nil, err
+    }
+
+    return entry, nil
 }
 
 func NewLogEntry(key string, value string, tombstone bool) *LogEntry {
