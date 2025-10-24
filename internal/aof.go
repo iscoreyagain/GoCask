@@ -19,6 +19,10 @@ type LogEntry struct {
 	Value     []byte
 }
 
+// logEntryHeaderSize is the size in bytes of the fixed-size header
+// preceding the variable-length key and value within a log entry.
+const logEntryHeaderSize int64 = 4 + 8 + 4 + 4 + 1
+
 // Write the decoded entry into the append-only write file and return the size of entry (err if it occurs)
 func writeLogEntry(file *os.File, entry *LogEntry) (int, error) {
 	total := 0
@@ -66,8 +70,7 @@ func readLogEntry(file *os.File, offset int64) (*LogEntry, error) {
 
     // Use pread-style reads that do not mutate the file offset.
     // Read the fixed-size header first.
-    const headerSize int64 = 4 + 8 + 4 + 4 + 1
-    headerReader := io.NewSectionReader(file, offset, headerSize)
+    headerReader := io.NewSectionReader(file, offset, logEntryHeaderSize)
 
     if err := binary.Read(headerReader, binary.BigEndian, &entry.crc); err != nil {
         return nil, err
@@ -90,13 +93,66 @@ func readLogEntry(file *os.File, offset int64) (*LogEntry, error) {
     valLen := int64(entry.valueSize)
 
     entry.Key = make([]byte, keyLen)
-    if _, err := io.ReadFull(io.NewSectionReader(file, offset+headerSize, keyLen), entry.Key); err != nil {
+    if _, err := io.ReadFull(io.NewSectionReader(file, offset+logEntryHeaderSize, keyLen), entry.Key); err != nil {
         return nil, err
     }
 
-    valueOffset := offset + headerSize + keyLen
+    valueOffset := offset + logEntryHeaderSize + keyLen
     entry.Value = make([]byte, valLen)
     if _, err := io.ReadFull(io.NewSectionReader(file, valueOffset, valLen), entry.Value); err != nil {
+        return nil, err
+    }
+
+    return entry, nil
+}
+
+// readLogEntryWithSize reads and decodes a log entry at the given offset using
+// the known total size of the entry. This avoids re-deriving the total length
+// from the header fields and enables a single contiguous read from disk.
+func readLogEntryWithSize(file *os.File, offset int64, size int64) (*LogEntry, error) {
+    if size < logEntryHeaderSize {
+        return nil, io.ErrUnexpectedEOF
+    }
+
+    buf := make([]byte, size)
+    if _, err := io.ReadFull(io.NewSectionReader(file, offset, size), buf); err != nil {
+        return nil, err
+    }
+
+    r := bytes.NewReader(buf)
+    entry := new(LogEntry)
+
+    if err := binary.Read(r, binary.BigEndian, &entry.crc); err != nil {
+        return nil, err
+    }
+    if err := binary.Read(r, binary.BigEndian, &entry.timestamp); err != nil {
+        return nil, err
+    }
+    if err := binary.Read(r, binary.BigEndian, &entry.keySize); err != nil {
+        return nil, err
+    }
+    if err := binary.Read(r, binary.BigEndian, &entry.valueSize); err != nil {
+        return nil, err
+    }
+    if err := binary.Read(r, binary.BigEndian, &entry.tombstone); err != nil {
+        return nil, err
+    }
+
+    keyLen := int(entry.keySize)
+    valLen := int(entry.valueSize)
+
+    // Sanity-check that the provided size matches header+payload
+    expected := int(logEntryHeaderSize) + keyLen + valLen
+    if len(buf) < expected {
+        return nil, io.ErrUnexpectedEOF
+    }
+
+    entry.Key = make([]byte, keyLen)
+    if _, err := io.ReadFull(r, entry.Key); err != nil {
+        return nil, err
+    }
+    entry.Value = make([]byte, valLen)
+    if _, err := io.ReadFull(r, entry.Value); err != nil {
         return nil, err
     }
 
