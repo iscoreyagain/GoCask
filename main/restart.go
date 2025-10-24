@@ -15,7 +15,7 @@ func MustGet(db *internal.BitCask, key string) string {
 }
 
 func main() {
-	fmt.Println("=== 2️⃣ LẦN CHẠY SAU: KIỂM TRA loadFiles() ===")
+	fmt.Println("=== TESTING WITH RECOVERY ===")
 	db := internal.Init() // <-- loadFiles() được gọi trong Init()
 
 	fmt.Println("GET name =", MustGet(db, "name"))

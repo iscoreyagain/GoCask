@@ -18,7 +18,7 @@ func MustGet(db *internal.BitCask, key string) string {
 // đã được định nghĩa trong cùng package hoặc import từ internal
 
 func main() {
-	fmt.Println("=== 1️⃣ LẦN CHẠY ĐẦU: GHI DỮ LIỆU ===")
+	fmt.Println("=== TESTING WITH WRITE DATA ===")
 	db := internal.Init()
 
 	db.Put("name", "Nguyen Le Quoc Thai")

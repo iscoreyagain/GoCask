@@ -10,31 +10,39 @@ import (
 func BenchmarkBitCask_Put(b *testing.B) {
 	dir := filepath.Join(os.TempDir(), "bitcask_bench_put")
 	os.RemoveAll(dir)
-	bc := Init()
+	bc := InitWithDir(dir)
+
+	// Precompute keys and values
+	keys := make([]string, b.N)
+	values := make([]string, b.N)
+	for i := 0; i < b.N; i++ {
+		keys[i] = fmt.Sprintf("key_%d", i)
+		values[i] = fmt.Sprintf("value_%d", i)
+	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("key_%d", i)
-		value := fmt.Sprintf("value_%d", i)
-		bc.Put(key, value)
+		bc.Put(keys[i], values[i])
 	}
 }
 
 func BenchmarkBitCask_Get(b *testing.B) {
 	dir := filepath.Join(os.TempDir(), "bitcask_bench_get")
 	os.RemoveAll(dir)
-	bc := Init()
+	bc := InitWithDir(dir)
 
-	// Preload keys
-	for i := 0; i < 100000; i++ {
+	numKeys := 10000
+	keys := make([]string, numKeys)
+	for i := 0; i < numKeys; i++ {
 		key := fmt.Sprintf("key_%d", i)
 		value := fmt.Sprintf("value_%d", i)
 		bc.Put(key, value)
+		keys[i] = key // precompute
 	}
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		key := fmt.Sprintf("key_%d", i%100000)
+		key := keys[i%numKeys] // just reuse precomputed string
 		bc.Get(key)
 	}
 }
@@ -42,7 +50,7 @@ func BenchmarkBitCask_Get(b *testing.B) {
 func BenchmarkBitCask_Delete(b *testing.B) {
 	dir := filepath.Join(os.TempDir(), "bitcask_bench_delete")
 	os.RemoveAll(dir)
-	bc := Init()
+	bc := InitWithDir(dir)
 
 	for i := 0; i < b.N; i++ {
 		key := fmt.Sprintf("key_%d", i)

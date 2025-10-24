@@ -10,41 +10,27 @@ import (
 )
 
 type LogEntry struct {
-	crc       uint32
-	timestamp int64
-	keySize   uint32
-	valueSize uint32
-	tombstone bool
-	Key       []byte
-	Value     []byte
+	Header *Header
+	Key    []byte
+	Value  []byte
+}
+
+type Header struct {
+	Crc       uint32
+	Timestamp int64
+	KeySize   uint32
+	ValueSize uint32
+	Tombstone bool
 }
 
 // Write the decoded entry into the append-only write file and return the size of entry (err if it occurs)
 func writeLogEntry(file *os.File, entry *LogEntry) (int, error) {
 	total := 0
 
-	fields := []interface{}{
-		entry.crc,
-		entry.timestamp,
-		entry.keySize,
-		entry.valueSize,
-		entry.tombstone,
+	if err := binary.Write(file, binary.BigEndian, entry.Header); err != nil {
+		return total, err
 	}
-
-	for _, field := range fields {
-		if err := binary.Write(file, binary.BigEndian, field); err != nil {
-			return total, err
-		}
-
-		switch field.(type) {
-		case uint32:
-			total += 4
-		case int64:
-			total += 8
-		case bool:
-			total += 1
-		}
-	}
+	total += logEntryHeaderSize
 
 	n, err := file.Write(entry.Key)
 	if err != nil {
@@ -61,46 +47,72 @@ func writeLogEntry(file *os.File, entry *LogEntry) (int, error) {
 	return total, nil
 }
 
-func readLogEntry(file *os.File, offset int64) (*LogEntry, error) {
-    entry := new(LogEntry)
+func readLogEntry(file *os.File, offset int64, size int64) (*LogEntry, error) {
+	if size < logEntryHeaderSize {
+		return nil, io.ErrUnexpectedEOF
+	}
 
-    // Use pread-style reads that do not mutate the file offset.
-    // Read the fixed-size header first.
-    const headerSize int64 = 4 + 8 + 4 + 4 + 1
-    headerReader := io.NewSectionReader(file, offset, headerSize)
+	buf := make([]byte, size)
+	n, err := file.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return nil, err
+	}
+	if int64(n) != size {
+		return nil, io.ErrUnexpectedEOF
+	}
 
-    if err := binary.Read(headerReader, binary.BigEndian, &entry.crc); err != nil {
-        return nil, err
-    }
-    if err := binary.Read(headerReader, binary.BigEndian, &entry.timestamp); err != nil {
-        return nil, err
-    }
-    if err := binary.Read(headerReader, binary.BigEndian, &entry.keySize); err != nil {
-        return nil, err
-    }
-    if err := binary.Read(headerReader, binary.BigEndian, &entry.valueSize); err != nil {
-        return nil, err
-    }
-    if err := binary.Read(headerReader, binary.BigEndian, &entry.tombstone); err != nil {
-        return nil, err
-    }
+	r := bytes.NewReader(buf)
 
-    // Read key and value using ReadAt via SectionReader to ensure full reads.
-    keyLen := int64(entry.keySize)
-    valLen := int64(entry.valueSize)
+	header := new(Header)
+	entry := new(LogEntry)
+	entry.Header = header
 
-    entry.Key = make([]byte, keyLen)
-    if _, err := io.ReadFull(io.NewSectionReader(file, offset+headerSize, keyLen), entry.Key); err != nil {
-        return nil, err
-    }
+	if err := binary.Read(r, binary.BigEndian, header); err != nil {
+		return nil, err
+	}
 
-    valueOffset := offset + headerSize + keyLen
-    entry.Value = make([]byte, valLen)
-    if _, err := io.ReadFull(io.NewSectionReader(file, valueOffset, valLen), entry.Value); err != nil {
-        return nil, err
-    }
+	keyLen, valLen := int(header.KeySize), int(header.ValueSize)
+	if logEntryHeaderSize+keyLen+valLen != len(buf) {
+		return nil, io.ErrUnexpectedEOF
+	}
 
-    return entry, nil
+	entry.Key = make([]byte, keyLen)
+	if _, err := io.ReadFull(r, entry.Key); err != nil {
+		return nil, err
+	}
+	entry.Value = make([]byte, valLen)
+	if _, err := io.ReadFull(r, entry.Value); err != nil {
+		return nil, err
+	}
+
+	return entry, nil
+}
+
+// This function will parse each entry in .log files and append it into KeyDir for lightning read.
+func parseEntry(file *os.File) (*LogEntry, int64, error) {
+	entry := new(LogEntry)
+	entry.Header = new(Header)
+
+	if err := binary.Read(file, binary.BigEndian, entry.Header); err != nil {
+		return nil, 0, io.ErrUnexpectedEOF
+	}
+
+	key := make([]byte, entry.Header.KeySize)
+	if _, err := io.ReadFull(file, key); err != nil {
+		return nil, 0, err
+	}
+
+	val := make([]byte, entry.Header.ValueSize)
+	if _, err := io.ReadFull(file, val); err != nil {
+		return nil, 0, err
+	}
+
+	entry.Key = key
+	entry.Value = val
+
+	totalSz := int64(logEntryHeaderSize + len(key) + len(val))
+
+	return entry, totalSz, nil
 }
 
 func NewLogEntry(key string, value string, tombstone bool) *LogEntry {
@@ -118,14 +130,17 @@ func NewLogEntry(key string, value string, tombstone bool) *LogEntry {
 	data.Write([]byte(value))
 	crc := calcCRC(data.Bytes())
 
+	header := &Header{
+		Crc:       crc,
+		Timestamp: timestamp,
+		KeySize:   keySize,
+		ValueSize: valueSize,
+		Tombstone: tombstone,
+	}
 	return &LogEntry{
-		crc:       crc,
-		timestamp: timestamp,
-		keySize:   keySize,
-		valueSize: valueSize,
-		tombstone: tombstone,
-		Key:       []byte(key),
-		Value:     []byte(value),
+		Header: header,
+		Key:    []byte(key),
+		Value:  []byte(value),
 	}
 }
 
@@ -135,5 +150,9 @@ func calcCRC(data []byte) uint32 {
 
 // Return the total size of the entry
 func (e *LogEntry) Size() int64 {
-	return int64(4 + 8 + 4 + 4 + 1 + len(e.Key) + len(e.Value))
+	return int64(logEntryHeaderSize + e.Header.KeySize + e.Header.ValueSize)
+}
+
+func (e *LogEntry) IsDeleted() bool {
+	return e.Header.Tombstone
 }

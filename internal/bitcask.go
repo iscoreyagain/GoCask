@@ -1,9 +1,9 @@
 package internal
 
 import (
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -49,10 +49,14 @@ func (bc *BitCask) Put(key string, value string) error {
 	bc.KeyDir[key] = ValuePointer{
 		FileId: bc.currentFileId,
 		Offset: offset,
-		Size:   int64(entry.valueSize),
+		Size:   entry.Size(),
 	}
 
 	bc.activeSize += int64(n)
+
+	if err := bc.ActiveFile.Sync(); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -71,12 +75,12 @@ func (bc *BitCask) Get(key string) (string, error) {
 		return "", fmt.Errorf("file not found!")
 	}
 
-	entry, err := readLogEntry(file, vp.Offset)
+	entry, err := readLogEntry(file, vp.Offset, vp.Size)
 	if err != nil {
 		return "", err
 	}
 
-	if entry.tombstone {
+	if entry.IsDeleted() {
 		return "", fmt.Errorf("key not found")
 	}
 
@@ -107,34 +111,6 @@ func (bc *BitCask) Delete(key string) error {
 	delete(bc.KeyDir, key)
 
 	return nil
-}
-
-func Init() *BitCask {
-	baseDir := "./logs"
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
-		log.Fatal(err)
-	}
-
-	bc := &BitCask{
-		KeyDir:        make(map[string]ValuePointer),
-		Files:         make(map[int]*os.File),
-		Mu:            &sync.RWMutex{},
-		currentFileId: 0,
-		ActiveFile:    nil,
-		activeSize:    0,
-		dir:           baseDir,
-	}
-	if err := bc.loadFiles(); err != nil {
-		log.Printf("Failed to load existing log files: %v\n", err)
-	}
-
-	if bc.ActiveFile == nil {
-		if err := bc.rollNewFile(); err != nil {
-			log.Fatalf("Failed to create new active file: %v\n", err)
-		}
-	}
-
-	return bc
 }
 
 func (bc *BitCask) rollNewFile() error {
@@ -209,31 +185,31 @@ func (bc *BitCask) loadFiles() error { // recover() from the existing files from
 		}
 	}
 
-    bc.currentFileId = maxId
+	bc.currentFileId = maxId
 
-    if maxId > 0 {
-        // The most recent file must be writable (active file). We initially opened
-        // every file as read-only to rebuild KeyDir safely. Now reopen the latest
-        // file with RW|APPEND so subsequent writes succeed.
-        if f, ok := bc.Files[maxId]; ok && f != nil {
-            _ = f.Close()
-        }
+	if maxId > 0 {
+		// The most recent file must be writable (active file). We initially opened
+		// every file as read-only to rebuild KeyDir safely. Now reopen the latest
+		// file with RW|APPEND so subsequent writes succeed.
+		if f, ok := bc.Files[maxId]; ok && f != nil {
+			_ = f.Close()
+		}
 
-        activePath := filepath.Join(bc.dir, fmt.Sprintf("%06d.log", maxId))
-        activeFile, err := os.OpenFile(activePath, os.O_RDWR|os.O_APPEND, 0644)
-        if err != nil {
-            return fmt.Errorf("failed to reopen active file for write: %w", err)
-        }
+		activePath := filepath.Join(bc.dir, fmt.Sprintf("%06d.log", maxId))
+		activeFile, err := os.OpenFile(activePath, os.O_RDWR|os.O_APPEND, 0644)
+		if err != nil {
+			return fmt.Errorf("failed to reopen active file for write: %w", err)
+		}
 
-        bc.Files[maxId] = activeFile
-        bc.ActiveFile = activeFile
+		bc.Files[maxId] = activeFile
+		bc.ActiveFile = activeFile
 
-        offset, err := bc.ActiveFile.Seek(0, io.SeekEnd)
-        if err != nil {
-            return fmt.Errorf("failed to seek active file: %w", err)
-        }
-        bc.activeSize = offset
-    }
+		offset, err := bc.ActiveFile.Seek(0, io.SeekEnd)
+		if err != nil {
+			return fmt.Errorf("failed to seek active file: %w", err)
+		}
+		bc.activeSize = offset
+	}
 
 	return nil
 }
@@ -242,15 +218,15 @@ func (bc *BitCask) rebuildKeyDirFromFile(file *os.File, fileId int) error {
 	var offset int64 = 0
 
 	for {
-		entry, err := readLogEntry(file, offset)
+		entry, size, err := parseEntry(file)
 		if err != nil {
-			if err == io.EOF {
+			if err == io.EOF || errors.Is(err, io.ErrUnexpectedEOF) {
 				break
 			}
 			return err
 		}
 
-		if entry.tombstone {
+		if entry.IsDeleted() {
 			// Remove deleted keys
 			delete(bc.KeyDir, string(entry.Key))
 		} else {
@@ -258,11 +234,11 @@ func (bc *BitCask) rebuildKeyDirFromFile(file *os.File, fileId int) error {
 			bc.KeyDir[string(entry.Key)] = ValuePointer{
 				FileId: fileId,
 				Offset: offset,
-				Size:   int64(entry.valueSize),
+				Size:   size,
 			}
 		}
 
-		offset += entry.Size()
+		offset += size
 	}
 
 	return nil
