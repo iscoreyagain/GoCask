@@ -209,13 +209,31 @@ func (bc *BitCask) loadFiles() error { // recover() from the existing files from
 		}
 	}
 
-	bc.currentFileId = maxId
+    bc.currentFileId = maxId
 
-	if maxId > 0 {
-		bc.ActiveFile = bc.Files[maxId]
-		offset, _ := bc.ActiveFile.Seek(0, io.SeekEnd)
-		bc.activeSize = offset
-	}
+    if maxId > 0 {
+        // The most recent file must be writable (active file). We initially opened
+        // every file as read-only to rebuild KeyDir safely. Now reopen the latest
+        // file with RW|APPEND so subsequent writes succeed.
+        if f, ok := bc.Files[maxId]; ok && f != nil {
+            _ = f.Close()
+        }
+
+        activePath := filepath.Join(bc.dir, fmt.Sprintf("%06d.log", maxId))
+        activeFile, err := os.OpenFile(activePath, os.O_RDWR|os.O_APPEND, 0644)
+        if err != nil {
+            return fmt.Errorf("failed to reopen active file for write: %w", err)
+        }
+
+        bc.Files[maxId] = activeFile
+        bc.ActiveFile = activeFile
+
+        offset, err := bc.ActiveFile.Seek(0, io.SeekEnd)
+        if err != nil {
+            return fmt.Errorf("failed to seek active file: %w", err)
+        }
+        bc.activeSize = offset
+    }
 
 	return nil
 }
