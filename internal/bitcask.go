@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 type BitCask struct {
@@ -20,6 +22,10 @@ type BitCask struct {
 	ActiveFile    *os.File // ONLY 1 active file to write and it's always written at the end
 	activeSize    int64    // Used to check whether this active file exceeds out of maximum allowed size, else trigger rollNewFile()
 	dir           string
+	// TESTING
+	writer *bufio.Writer
+	done   chan struct{}
+	syncWg *sync.WaitGroup
 }
 
 type ValuePointer struct {
@@ -28,6 +34,74 @@ type ValuePointer struct {
 	Size   int64
 }
 
+func Open(dir string) (*BitCask, error) {
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, err
+	}
+
+	bc := &BitCask{
+		dir:    dir,
+		KeyDir: make(map[string]ValuePointer),
+		Files:  make(map[int]*os.File),
+		done:   make(chan struct{}),
+		syncWg: &sync.WaitGroup{},
+		Mu:     &sync.RWMutex{},
+	}
+
+	if err := bc.loadFiles(); err != nil {
+		return nil, err
+	}
+
+	if bc.ActiveFile == nil {
+		if err := bc.rollNewFile(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Initialize buffered writer
+	bc.writer = bufio.NewWriterSize(bc.ActiveFile, 64*1024) // 64KB buffer
+
+	// Start background sync
+	bc.startBackgroundSync()
+
+	return bc, nil
+}
+
+func (bc *BitCask) startBackgroundSync() {
+	bc.syncWg.Add(1)
+
+	go func() {
+		defer bc.syncWg.Done()
+
+		ticker := time.NewTicker(syncInterval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				bc.Mu.Lock()
+				if bc.writer != nil {
+					_ = bc.writer.Flush()
+				}
+				if bc.ActiveFile != nil {
+					_ = bc.ActiveFile.Sync()
+				}
+				bc.Mu.Unlock()
+
+			case <-bc.done:
+				bc.Mu.Lock()
+				if bc.writer != nil {
+					_ = bc.writer.Flush()
+				}
+				if bc.ActiveFile != nil {
+					_ = bc.ActiveFile.Sync()
+				}
+				bc.Mu.Unlock()
+				return
+			}
+		}
+	}()
+}
 func (bc *BitCask) Put(key string, value string) error {
 	bc.Mu.Lock()
 	defer bc.Mu.Unlock()
@@ -41,7 +115,7 @@ func (bc *BitCask) Put(key string, value string) error {
 
 	offset := bc.activeSize
 
-	n, err := writeLogEntry(bc.ActiveFile, entry)
+	n, err := writeLogEntryBuffered(bc.writer, entry)
 	if err != nil {
 		return fmt.Errorf("failed to write log entry: %w", err)
 	}
@@ -51,12 +125,7 @@ func (bc *BitCask) Put(key string, value string) error {
 		Offset: offset,
 		Size:   entry.Size(),
 	}
-
 	bc.activeSize += int64(n)
-
-	if err := bc.ActiveFile.Sync(); err != nil {
-		return err
-	}
 
 	return nil
 }
@@ -103,7 +172,7 @@ func (bc *BitCask) Delete(key string) error {
 		}
 	}
 
-	n, err := writeLogEntry(bc.ActiveFile, entry)
+	n, err := writeLogEntryBuffered(bc.writer, entry)
 	if err != nil {
 		return fmt.Errorf("failed to write log entry: %w", err)
 	}
@@ -147,8 +216,9 @@ func (bc *BitCask) rollNewFile() error {
 	bc.currentFileId = newId
 	bc.ActiveFile = file
 	bc.activeSize = 0
-
 	bc.Files[newId] = file
+
+	bc.writer = bufio.NewWriterSize(file, 64*1024)
 
 	return nil
 }
@@ -209,6 +279,8 @@ func (bc *BitCask) loadFiles() error { // recover() from the existing files from
 			return fmt.Errorf("failed to seek active file: %w", err)
 		}
 		bc.activeSize = offset
+
+		bc.writer = bufio.NewWriterSize(bc.ActiveFile, 64*1024)
 	}
 
 	return nil
@@ -239,6 +311,52 @@ func (bc *BitCask) rebuildKeyDirFromFile(file *os.File, fileId int) error {
 		}
 
 		offset += size
+	}
+
+	return nil
+}
+
+func (bc *BitCask) Sync() error {
+	bc.Mu.Lock()
+	defer bc.Mu.Unlock()
+
+	if bc.writer != nil {
+		if err := bc.writer.Flush(); err != nil {
+			return fmt.Errorf("failed to flush buffer: %w", err)
+		}
+	}
+
+	if bc.ActiveFile != nil {
+		if err := bc.ActiveFile.Sync(); err != nil {
+			return fmt.Errorf("failed to sync to disk: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (bc *BitCask) Close() error {
+	close(bc.done)
+	bc.syncWg.Wait()
+	bc.Mu.Lock()
+	defer bc.Mu.Unlock()
+
+	if bc.writer != nil {
+		if err := bc.writer.Flush(); err != nil {
+			return fmt.Errorf("failed to flush buffer on close: %w", err)
+		}
+	}
+
+	if bc.ActiveFile != nil {
+		if err := bc.ActiveFile.Sync(); err != nil {
+			return fmt.Errorf("failed to sync on close: %w", err)
+		}
+	}
+
+	for id, file := range bc.Files {
+		if err := file.Close(); err != nil {
+			return fmt.Errorf("failed to close file %d: %w", id, err)
+		}
 	}
 
 	return nil

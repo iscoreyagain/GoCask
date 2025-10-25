@@ -21,7 +21,6 @@ func Init() *BitCask {
 		currentFileId: 0,
 		ActiveFile:    nil,
 		activeSize:    0,
-		dir:           baseDir,
 	}
 	if err := bc.loadFiles(); err != nil {
 		log.Printf("Failed to load existing log files: %v\n", err)
@@ -48,7 +47,6 @@ func InitWithDir(baseDir string) *BitCask {
 		currentFileId: 0,
 		ActiveFile:    nil,
 		activeSize:    0,
-		dir:           baseDir,
 	}
 
 	return bc

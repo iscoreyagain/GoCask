@@ -1,6 +1,7 @@
 package internal
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/binary"
 	"hash/crc32"
@@ -23,7 +24,69 @@ type Header struct {
 	Tombstone bool
 }
 
+func NewLogEntry(key string, value string, tombstone bool) *LogEntry {
+	timestamp := time.Now().UnixNano()
+	keySize := uint32(len([]byte(key)))
+	valueSize := uint32(len([]byte(value)))
+
+	// data byte slice to calculate CRC
+	data := new(bytes.Buffer)
+	binary.Write(data, binary.BigEndian, timestamp)
+	binary.Write(data, binary.BigEndian, keySize)
+	binary.Write(data, binary.BigEndian, valueSize)
+	binary.Write(data, binary.BigEndian, tombstone)
+	data.Write([]byte(key))
+	data.Write([]byte(value))
+	crc := calcCRC(data.Bytes())
+
+	header := &Header{
+		Crc:       crc,
+		Timestamp: timestamp,
+		KeySize:   keySize,
+		ValueSize: valueSize,
+		Tombstone: tombstone,
+	}
+	return &LogEntry{
+		Header: header,
+		Key:    []byte(key),
+		Value:  []byte(value),
+	}
+}
+
+func (e *LogEntry) Serialize() []byte {
+	size := logEntryHeaderSize + len(e.Key) + len(e.Value)
+	buf := make([]byte, size)
+
+	// Write header fields
+	binary.BigEndian.PutUint32(buf[0:4], e.Header.Crc)
+	binary.BigEndian.PutUint64(buf[4:12], uint64(e.Header.Timestamp))
+	binary.BigEndian.PutUint32(buf[12:16], e.Header.KeySize)
+	binary.BigEndian.PutUint32(buf[16:20], e.Header.ValueSize)
+
+	// Write tombstone as byte (0 or 1)
+	if e.Header.Tombstone {
+		buf[20] = 1
+	} else {
+		buf[20] = 0
+	}
+
+	// Copy key and value
+	copy(buf[21:], e.Key)
+	copy(buf[21+len(e.Key):], e.Value)
+
+	return buf
+}
+
+func (e *LogEntry) Size() int64 {
+	return int64(logEntryHeaderSize + e.Header.KeySize + e.Header.ValueSize)
+}
+
+func (e *LogEntry) IsDeleted() bool {
+	return e.Header.Tombstone
+}
+
 // Write the decoded entry into the append-only write file and return the size of entry (err if it occurs)
+// DEPRECATED
 func writeLogEntry(file *os.File, entry *LogEntry) (int, error) {
 	total := 0
 
@@ -45,6 +108,11 @@ func writeLogEntry(file *os.File, entry *LogEntry) (int, error) {
 	total += n
 
 	return total, nil
+}
+
+func writeLogEntryBuffered(w *bufio.Writer, entry *LogEntry) (int, error) {
+	data := entry.Serialize()
+	return w.Write(data)
 }
 
 func readLogEntry(file *os.File, offset int64, size int64) (*LogEntry, error) {
@@ -115,44 +183,6 @@ func parseEntry(file *os.File) (*LogEntry, int64, error) {
 	return entry, totalSz, nil
 }
 
-func NewLogEntry(key string, value string, tombstone bool) *LogEntry {
-	timestamp := time.Now().UnixNano()
-	keySize := uint32(len([]byte(key)))
-	valueSize := uint32(len([]byte(value)))
-
-	// data byte slice to calculate CRC
-	data := new(bytes.Buffer)
-	binary.Write(data, binary.BigEndian, timestamp)
-	binary.Write(data, binary.BigEndian, keySize)
-	binary.Write(data, binary.BigEndian, valueSize)
-	binary.Write(data, binary.BigEndian, tombstone)
-	data.Write([]byte(key))
-	data.Write([]byte(value))
-	crc := calcCRC(data.Bytes())
-
-	header := &Header{
-		Crc:       crc,
-		Timestamp: timestamp,
-		KeySize:   keySize,
-		ValueSize: valueSize,
-		Tombstone: tombstone,
-	}
-	return &LogEntry{
-		Header: header,
-		Key:    []byte(key),
-		Value:  []byte(value),
-	}
-}
-
 func calcCRC(data []byte) uint32 {
 	return crc32.Checksum(data, crc32.MakeTable(crc32.Castagnoli))
-}
-
-// Return the total size of the entry
-func (e *LogEntry) Size() int64 {
-	return int64(logEntryHeaderSize + e.Header.KeySize + e.Header.ValueSize)
-}
-
-func (e *LogEntry) IsDeleted() bool {
-	return e.Header.Tombstone
 }
