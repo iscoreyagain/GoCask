@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -18,9 +19,9 @@ type BitCask struct {
 	KeyDir        map[string]ValuePointer
 	Files         map[int]*os.File // Multiple file descriptors for read
 	Mu            *sync.RWMutex
-	currentFileId int
+	CurrentFileId int
 	ActiveFile    *os.File // ONLY 1 active file to write and it's always written at the end
-	activeSize    int64    // Used to check whether this active file exceeds out of maximum allowed size, else trigger rollNewFile()
+	ActiveSize    int64    // Used to check whether this active file exceeds out of maximum allowed size, else trigger rollNewFile()
 	dir           string
 	// TESTING
 	writer *bufio.Writer
@@ -48,13 +49,14 @@ func Open(dir string) (*BitCask, error) {
 		Mu:     &sync.RWMutex{},
 	}
 
-	if err := bc.loadFiles(); err != nil {
+	if err := bc.LoadFiles(); err != nil {
 		return nil, err
 	}
 
 	if bc.ActiveFile == nil {
-		if err := bc.rollNewFile(); err != nil {
-			return nil, err
+		log.Println("ActiveFile is nil, rolling a new file")
+		if err := bc.RollNewFile(); err != nil {
+			return nil, fmt.Errorf("failed to roll new file: %v", err)
 		}
 	}
 
@@ -107,13 +109,13 @@ func (bc *BitCask) Put(key string, value string) error {
 	defer bc.Mu.Unlock()
 	entry := NewLogEntry(key, value, false)
 
-	if bc.ActiveFile == nil || bc.activeSize+entry.Size() >= MaxActiveFileSize {
-		if err := bc.rollNewFile(); err != nil {
+	if bc.ActiveFile == nil || bc.ActiveSize+entry.Size() >= MaxActiveFileSize {
+		if err := bc.RollNewFile(); err != nil {
 			return fmt.Errorf("failed to roll new file: %w", err)
 		}
 	}
 
-	offset := bc.activeSize
+	offset := bc.ActiveSize
 
 	n, err := writeLogEntryBuffered(bc.writer, entry)
 	if err != nil {
@@ -121,11 +123,11 @@ func (bc *BitCask) Put(key string, value string) error {
 	}
 
 	bc.KeyDir[key] = ValuePointer{
-		FileId: bc.currentFileId,
+		FileId: bc.CurrentFileId,
 		Offset: offset,
 		Size:   entry.Size(),
 	}
-	bc.activeSize += int64(n)
+	bc.ActiveSize += int64(n)
 
 	return nil
 }
@@ -166,8 +168,8 @@ func (bc *BitCask) Delete(key string) error {
 
 	entry := NewLogEntry(key, "", true)
 
-	if bc.ActiveFile == nil || bc.activeSize+entry.Size() >= MaxActiveFileSize {
-		if err := bc.rollNewFile(); err != nil {
+	if bc.ActiveFile == nil || bc.ActiveSize+entry.Size() >= MaxActiveFileSize {
+		if err := bc.RollNewFile(); err != nil {
 			return fmt.Errorf("failed to roll new file: %w", err)
 		}
 	}
@@ -176,15 +178,15 @@ func (bc *BitCask) Delete(key string) error {
 	if err != nil {
 		return fmt.Errorf("failed to write log entry: %w", err)
 	}
-	bc.activeSize += int64(n)
+	bc.ActiveSize += int64(n)
 	delete(bc.KeyDir, key)
 
 	return nil
 }
 
-func (bc *BitCask) rollNewFile() error {
+func (bc *BitCask) RollNewFile() error {
 	if bc.ActiveFile != nil {
-		oldFileId := bc.currentFileId
+		oldFileId := bc.CurrentFileId
 
 		// Move old write-only file into a map of read-only files
 		if err := bc.ActiveFile.Sync(); err != nil {
@@ -202,7 +204,7 @@ func (bc *BitCask) rollNewFile() error {
 		bc.Files[oldFileId] = readFile
 	}
 
-	newId := bc.currentFileId + 1
+	newId := bc.CurrentFileId + 1
 
 	fileName := fmt.Sprintf("%06d.log", newId)
 	filePath := filepath.Join(bc.dir, fileName)
@@ -213,9 +215,9 @@ func (bc *BitCask) rollNewFile() error {
 	}
 
 	// Bitcask instance have a new active file and new currentFileId
-	bc.currentFileId = newId
+	bc.CurrentFileId = newId
 	bc.ActiveFile = file
-	bc.activeSize = 0
+	bc.ActiveSize = 0
 	bc.Files[newId] = file
 
 	bc.writer = bufio.NewWriterSize(file, 64*1024)
@@ -223,8 +225,11 @@ func (bc *BitCask) rollNewFile() error {
 	return nil
 }
 
-func (bc *BitCask) loadFiles() error { // recover() from the existing files from ./logs folder
+func (bc *BitCask) LoadFiles() error {
+	// recover() from the existing files from ./logs folder
 	files, _ := filepath.Glob(filepath.Join(bc.dir, "*.log"))
+	log.Println("BitCask data dir:", bc.dir)
+	log.Println("Found log files:", files)
 
 	bc.Files = make(map[int]*os.File)
 	maxId := 0
@@ -255,7 +260,7 @@ func (bc *BitCask) loadFiles() error { // recover() from the existing files from
 		}
 	}
 
-	bc.currentFileId = maxId
+	bc.CurrentFileId = maxId
 
 	if maxId > 0 {
 		// The most recent file must be writable (active file). We initially opened
@@ -278,7 +283,7 @@ func (bc *BitCask) loadFiles() error { // recover() from the existing files from
 		if err != nil {
 			return fmt.Errorf("failed to seek active file: %w", err)
 		}
-		bc.activeSize = offset
+		bc.ActiveSize = offset
 
 		bc.writer = bufio.NewWriterSize(bc.ActiveFile, 64*1024)
 	}

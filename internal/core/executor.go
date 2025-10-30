@@ -133,6 +133,9 @@ func cmdINFO(args []string) string {
 }
 
 func cmdSYNC(args []string) string {
+	if len(args) != 0 {
+		return "-ERR wrong number of arguments for 'SYNC' command"
+	}
 	if err := bc.Sync(); err != nil {
 		return fmt.Sprintf("-ERR %v", err)
 	}
