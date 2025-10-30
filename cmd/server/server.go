@@ -89,7 +89,7 @@ func (s *Server) handleConnection(conn net.Conn) {
 		}
 		response := core.ExecuteAndResponse(cmd)
 
-		writer.WriteString(response + "\n")
+		writer.WriteString(response + "\r\n")
 		writer.Flush()
 	}
 

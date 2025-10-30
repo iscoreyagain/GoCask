@@ -122,6 +122,10 @@ func (bc *BitCask) Put(key string, value string) error {
 		return fmt.Errorf("failed to write log entry: %w", err)
 	}
 
+	if err := bc.writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush writer: %w", err)
+	}
+	
 	bc.KeyDir[key] = ValuePointer{
 		FileId: bc.CurrentFileId,
 		Offset: offset,

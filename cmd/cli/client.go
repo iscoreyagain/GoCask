@@ -35,19 +35,26 @@ func NewClient(addr string) (*Client, error) {
 
 func (c *Client) SendCommand(cmd string) (string, error) {
 	// Send command
-	_, err := c.writer.WriteString(cmd + "\n")
+	_, err := c.writer.WriteString(cmd + "\r\n")
 	if err != nil {
 		return "", err
 	}
 	c.writer.Flush()
 
 	// Read response
-	response, err := c.reader.ReadString('\n')
-	if err != nil {
-		return "", err
+	var response string
+	for {
+		response, err = c.reader.ReadString('\n')
+		if err != nil {
+			return "", err
+		}
+		response = strings.TrimRight(response, "\r\n")
+		if response != "" {
+			break
+		}
 	}
 
-	return strings.TrimSpace(response), nil
+	return response, nil
 }
 
 func (c *Client) ReadBulkString(firstLine string) (string, error) {
